@@ -28,6 +28,13 @@ type validate struct {
 	fldIsPointer   bool          // StructLevel & FieldLevel
 	isPartial      bool
 	hasExcludes    bool
+
+	// 按调用生效的观察状态：仅 StructCtxObserved / VarCtxObserved 设置，
+	// 随 sync.Pool 取用而隔离，并发调用与重入调用之间互不影响。
+	observe    ObserveFunc     // 当前调用的观察函数，nil 表示不观察
+	obsCtx     context.Context // 结构级上报回调（无 ctx 参数）使用的上下文
+	observeErr error           // 观察函数返回的首个错误，非 nil 后遍历立即停止
+	seq        uint64          // 当前调用内已发送的事件序号
 }
 
 // parent and current will be the same the first run of validateStruct
@@ -51,6 +58,11 @@ func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, cur
 		var f *cField
 
 		for i := 0; i < len(cs.fields); i++ {
+			// 观察函数要求中止时，不再遍历剩余字段
+			if v.observeErr != nil {
+				return
+			}
+
 			f = cs.fields[i]
 
 			if v.isPartial {
@@ -76,11 +88,13 @@ func (v *validate) validateStruct(ctx context.Context, parent reflect.Value, cur
 	// check if any struct level validations, after all field validations already checked.
 	// first iteration will have no info about nostructlevel tag, and is checked prior to
 	// calling the next iteration of validateStruct called from traverseField.
-	if cs.fn != nil {
+	// 字段遍历期间观察函数可能已经要求中止，此时结构级验证同样不再执行
+	if cs.fn != nil && v.observeErr == nil {
 		v.slflParent = parent
 		v.slCurrent = current
 		v.ns = ns
 		v.actualNs = structNs
+		v.obsCtx = ctx
 
 		cs.fn(ctx, v)
 	}
@@ -122,19 +136,20 @@ func (v *validate) traverseField(ctx context.Context, parent reflect.Value, curr
 				} else {
 					v.str2 = v.str1
 				}
-				v.errs = append(v.errs,
-					&fieldError{
-						v:              v.v,
-						tag:            ct.aliasTag,
-						actualTag:      ct.tag,
-						ns:             v.str1,
-						structNs:       v.str2,
-						fieldLen:       uint8(len(cf.altName)),
-						structfieldLen: uint8(len(cf.name)),
-						param:          ct.param,
-						kind:           kind,
-					},
-				)
+				fe := &fieldError{
+					v:              v.v,
+					tag:            ct.aliasTag,
+					actualTag:      ct.tag,
+					ns:             v.str1,
+					structNs:       v.str2,
+					fieldLen:       uint8(len(cf.altName)),
+					structfieldLen: uint8(len(cf.name)),
+					param:          ct.param,
+					kind:           kind,
+				}
+				v.errs = append(v.errs, fe)
+				// 无类型 nil 被判定为当前规则失败（规则函数本身不会执行）
+				v.observeRule(ctx, ns, structNs, cf, ct, nil, false, fe)
 				return
 			}
 
@@ -145,21 +160,22 @@ func (v *validate) traverseField(ctx context.Context, parent reflect.Value, curr
 				v.str2 = v.str1
 			}
 			if !ct.runValidationWhenNil {
-				v.errs = append(v.errs,
-					&fieldError{
-						v:              v.v,
-						tag:            ct.aliasTag,
-						actualTag:      ct.tag,
-						ns:             v.str1,
-						structNs:       v.str2,
-						fieldLen:       uint8(len(cf.altName)),
-						structfieldLen: uint8(len(cf.name)),
-						value:          getValue(current),
-						param:          ct.param,
-						kind:           kind,
-						typ:            current.Type(),
-					},
-				)
+				fe := &fieldError{
+					v:              v.v,
+					tag:            ct.aliasTag,
+					actualTag:      ct.tag,
+					ns:             v.str1,
+					structNs:       v.str2,
+					fieldLen:       uint8(len(cf.altName)),
+					structfieldLen: uint8(len(cf.name)),
+					value:          getValue(current),
+					param:          ct.param,
+					kind:           kind,
+					typ:            current.Type(),
+				}
+				v.errs = append(v.errs, fe)
+				// nil 指针/接口且规则不允许在 nil 上执行时，当前规则直接失败
+				v.observeRule(ctx, ns, structNs, cf, ct, current.Type(), false, fe)
 				return
 			}
 		}
@@ -184,6 +200,11 @@ func (v *validate) traverseField(ctx context.Context, parent reflect.Value, curr
 
 OUTER:
 	for {
+		// 观察函数返回错误后，规则链不再继续执行
+		if v.observeErr != nil {
+			return
+		}
+
 		if ct == nil || !ct.hasTag || (isNestedStruct && len(cf.name) == 0) {
 			// isNestedStruct check here
 			if isNestedStruct {
@@ -308,6 +329,11 @@ OUTER:
 						reusableCF.altName = string(v.misc)
 					}
 					v.traverseField(ctx, parent, current.Index(i), ns, structNs, reusableCF, ct)
+
+					// 观察中止后不再遍历剩余元素
+					if v.observeErr != nil {
+						return
+					}
 				}
 
 			case reflect.Map:
@@ -338,6 +364,9 @@ OUTER:
 
 					if ct != nil && ct.typeof == typeKeys && ct.keys != nil {
 						v.traverseField(ctx, parent, key, ns, structNs, reusableCF, ct.keys)
+						if v.observeErr != nil {
+							return
+						}
 						// can be nil when just keys being validated
 						if ct.next != nil {
 							v.traverseField(ctx, parent, current.MapIndex(key), ns, structNs, reusableCF, ct.next)
@@ -356,6 +385,11 @@ OUTER:
 						}
 					} else {
 						v.traverseField(ctx, parent, current.MapIndex(key), ns, structNs, reusableCF, ct)
+					}
+
+					// 观察中止后不再遍历剩余键值对
+					if v.observeErr != nil {
+						return
 					}
 				}
 
@@ -379,6 +413,12 @@ OUTER:
 				v.ct = ct
 
 				if ct.fn(ctx, v) {
+					// or 分支实际执行且通过；后续未执行的分支仅被排空，不产生事件
+					v.observeRule(ctx, ns, structNs, cf, ct, typ, true, nil)
+					if v.observeErr != nil {
+						return
+					}
+
 					if ct.isBlockEnd {
 						ct = ct.next
 						continue OUTER
@@ -403,6 +443,15 @@ OUTER:
 					}
 				}
 
+				// 该 or 分支执行失败：若不是最后一个分支，先发送一条不带 FieldError
+				// 的失败事件；整体失败的聚合错误随最后一个分支的事件上报。
+				if !ct.isBlockEnd && ct.next != nil {
+					v.observeRule(ctx, ns, structNs, cf, ct, typ, false, nil)
+					if v.observeErr != nil {
+						return
+					}
+				}
+
 				v.misc = append(v.misc, '|')
 				v.misc = append(v.misc, ct.tag...)
 
@@ -421,42 +470,43 @@ OUTER:
 						v.str2 = v.str1
 					}
 
+					var fe *fieldError
+
 					if ct.hasAlias {
-						v.errs = append(v.errs,
-							&fieldError{
-								v:              v.v,
-								tag:            ct.aliasTag,
-								actualTag:      ct.actualAliasTag,
-								ns:             v.str1,
-								structNs:       v.str2,
-								fieldLen:       uint8(len(cf.altName)),
-								structfieldLen: uint8(len(cf.name)),
-								value:          getValue(current),
-								param:          ct.param,
-								kind:           kind,
-								typ:            typ,
-							},
-						)
+						fe = &fieldError{
+							v:              v.v,
+							tag:            ct.aliasTag,
+							actualTag:      ct.actualAliasTag,
+							ns:             v.str1,
+							structNs:       v.str2,
+							fieldLen:       uint8(len(cf.altName)),
+							structfieldLen: uint8(len(cf.name)),
+							value:          getValue(current),
+							param:          ct.param,
+							kind:           kind,
+							typ:            typ,
+						}
 					} else {
 						tVal := string(v.misc)[1:]
 
-						v.errs = append(v.errs,
-							&fieldError{
-								v:              v.v,
-								tag:            tVal,
-								actualTag:      tVal,
-								ns:             v.str1,
-								structNs:       v.str2,
-								fieldLen:       uint8(len(cf.altName)),
-								structfieldLen: uint8(len(cf.name)),
-								value:          getValue(current),
-								param:          ct.param,
-								kind:           kind,
-								typ:            typ,
-							},
-						)
+						fe = &fieldError{
+							v:              v.v,
+							tag:            tVal,
+							actualTag:      tVal,
+							ns:             v.str1,
+							structNs:       v.str2,
+							fieldLen:       uint8(len(cf.altName)),
+							structfieldLen: uint8(len(cf.name)),
+							value:          getValue(current),
+							param:          ct.param,
+							kind:           kind,
+							typ:            typ,
+						}
 					}
 
+					v.errs = append(v.errs, fe)
+					// 聚合 FieldError 附着在最后一个实际执行的失败分支事件上
+					v.observeRule(ctx, ns, structNs, cf, ct, typ, false, fe)
 					return
 				}
 
@@ -471,7 +521,11 @@ OUTER:
 			v.cf = cf
 			v.ct = ct
 
-			if !ct.fn(ctx, v) {
+			passed := ct.fn(ctx, v)
+
+			var fe *fieldError
+
+			if !passed {
 				v.str1 = appendAltName(ns, cf.altName)
 
 				if v.v.hasTagNameFunc {
@@ -480,24 +534,30 @@ OUTER:
 					v.str2 = v.str1
 				}
 
-				v.errs = append(v.errs,
-					&fieldError{
-						v:              v.v,
-						tag:            ct.aliasTag,
-						actualTag:      ct.tag,
-						ns:             v.str1,
-						structNs:       v.str2,
-						fieldLen:       uint8(len(cf.altName)),
-						structfieldLen: uint8(len(cf.name)),
-						value:          getValue(current),
-						param:          ct.param,
-						kind:           kind,
-						typ:            typ,
-					},
-				)
+				fe = &fieldError{
+					v:              v.v,
+					tag:            ct.aliasTag,
+					actualTag:      ct.tag,
+					ns:             v.str1,
+					structNs:       v.str2,
+					fieldLen:       uint8(len(cf.altName)),
+					structfieldLen: uint8(len(cf.name)),
+					value:          getValue(current),
+					param:          ct.param,
+					kind:           kind,
+					typ:            typ,
+				}
 
+				v.errs = append(v.errs, fe)
+			}
+
+			// 每个实际执行的字段规则（含自定义验证函数）都在此发出事件
+			v.observeRule(ctx, ns, structNs, cf, ct, typ, passed, fe)
+
+			if v.observeErr != nil || !passed {
 				return
 			}
+
 			ct = ct.next
 		}
 	}

@@ -122,24 +122,7 @@ func (v *validate) ReportError(field interface{}, fieldName, structFieldName, ta
 	}
 
 	if kind == reflect.Invalid {
-		v.errs = append(v.errs,
-			&fieldError{
-				v:              v.v,
-				tag:            tag,
-				actualTag:      tag,
-				ns:             v.str1,
-				structNs:       v.str2,
-				fieldLen:       uint8(len(fieldName)),
-				structfieldLen: uint8(len(structFieldName)),
-				param:          param,
-				kind:           kind,
-			},
-		)
-		return
-	}
-
-	v.errs = append(v.errs,
-		&fieldError{
+		fe := &fieldError{
 			v:              v.v,
 			tag:            tag,
 			actualTag:      tag,
@@ -147,12 +130,30 @@ func (v *validate) ReportError(field interface{}, fieldName, structFieldName, ta
 			structNs:       v.str2,
 			fieldLen:       uint8(len(fieldName)),
 			structfieldLen: uint8(len(structFieldName)),
-			value:          getValue(fv),
 			param:          param,
 			kind:           kind,
-			typ:            fv.Type(),
-		},
-	)
+		}
+		v.errs = append(v.errs, fe)
+		// 结构级验证主动上报的错误同样发送观察事件
+		v.observeReported(fe)
+		return
+	}
+
+	fe := &fieldError{
+		v:              v.v,
+		tag:            tag,
+		actualTag:      tag,
+		ns:             v.str1,
+		structNs:       v.str2,
+		fieldLen:       uint8(len(fieldName)),
+		structfieldLen: uint8(len(structFieldName)),
+		value:          getValue(fv),
+		param:          param,
+		kind:           kind,
+		typ:            fv.Type(),
+	}
+	v.errs = append(v.errs, fe)
+	v.observeReported(fe)
 }
 
 // ReportValidationErrors reports ValidationErrors obtained from running validations within the Struct Level validation.
@@ -167,5 +168,10 @@ func (v *validate) ReportValidationErrors(relativeNamespace, relativeStructNames
 		err.structNs = string(append(append(v.actualNs, relativeStructNamespace...), err.structNs...))
 
 		v.errs = append(v.errs, err)
+		// 每条转发的结构级错误都按上报顺序产生一个观察事件
+		v.observeReported(err)
+		if v.observeErr != nil {
+			return
+		}
 	}
 }

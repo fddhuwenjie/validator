@@ -382,6 +382,54 @@ func (v *Validate) StructCtx(ctx context.Context, s interface{}) (err error) {
 	return
 }
 
+// StructCtxObserved 与 StructCtx 的验证行为完全一致，额外为本次调用注册一个
+// 观察函数：验证过程中每个实际执行的字段规则，以及结构级验证主动上报的每条
+// 错误，都会按真实遍历顺序同步发送一个不可变的 ValidationEvent。
+//
+// observe 为 nil 时直接委托 StructCtx，返回值、错误类型、字段顺序、缓存与
+// 并发行为与现有入口完全一致。
+//
+// 当 observe 返回非 nil 错误时，验证立即停止并原样返回该错误（此时不会返回
+// ValidationErrors）；此前已经收到的事件保持既定顺序。观察状态仅属于当前调用，
+// 并发调用互不干扰，observe 内部也可以重新进入同一个 *Validate 发起验证。
+//
+// 除 observe 触发中止的情形外，它返回 InvalidValidationError 或 nil /
+// ValidationErrors，类型断言方式与 StructCtx 相同。
+func (v *Validate) StructCtxObserved(ctx context.Context, s interface{}, observe ObserveFunc) (err error) {
+	// 空观察函数等价于普通入口，复用既有实现保证行为完全兼容
+	if observe == nil {
+		return v.StructCtx(ctx, s)
+	}
+
+	val := reflect.ValueOf(s)
+	top := val
+
+	if val.Kind() == reflect.Ptr && !val.IsNil() {
+		val = val.Elem()
+	}
+
+	if val.Kind() != reflect.Struct || val.Type().ConvertibleTo(timeType) {
+		return &InvalidValidationError{Type: reflect.TypeOf(s)}
+	}
+
+	// good to validate
+	vd := v.pool.Get().(*validate)
+	vd.top = top
+	vd.isPartial = false
+	vd.observe = observe
+	vd.obsCtx = ctx
+	vd.observeErr = nil
+	vd.seq = 0
+
+	vd.validateStruct(ctx, top, val, val.Type(), vd.ns[0:0], vd.actualNs[0:0], nil)
+
+	err = vd.finishObserved()
+
+	v.pool.Put(vd)
+
+	return
+}
+
 // StructFiltered validates a structs exposed fields, that pass the FilterFunc check and automatically validates
 // nested structs, unless otherwise specified.
 //
@@ -626,6 +674,40 @@ func (v *Validate) VarCtx(ctx context.Context, field interface{}, tag string) (e
 		err = vd.errs
 		vd.errs = nil
 	}
+	v.pool.Put(vd)
+	return
+}
+
+// VarCtxObserved 与 VarCtx 的验证行为完全一致，额外为本次调用注册一个观察函数，
+// 事件语义与 StructCtxObserved 相同：每个实际执行的字段规则（包括 dive 进入
+// slice、map、嵌套结构后执行的规则）按真实遍历顺序产生一个 ValidationEvent。
+//
+// observe 为 nil 时直接委托 VarCtx；observe 返回非 nil 错误时立即停止验证并
+// 原样返回该错误。观察状态按调用隔离，支持并发调用与回调内重入同一个验证器。
+func (v *Validate) VarCtxObserved(ctx context.Context, field interface{}, tag string, observe ObserveFunc) (err error) {
+	if len(tag) == 0 || tag == skipValidationTag {
+		return nil
+	}
+
+	// 空观察函数等价于普通入口，复用既有实现保证行为完全兼容
+	if observe == nil {
+		return v.VarCtx(ctx, field, tag)
+	}
+
+	ctag := v.fetchCacheTag(tag)
+
+	val := reflect.ValueOf(field)
+	vd := v.pool.Get().(*validate)
+	vd.top = val
+	vd.isPartial = false
+	vd.observe = observe
+	vd.obsCtx = ctx
+	vd.observeErr = nil
+	vd.seq = 0
+	vd.traverseField(ctx, val, val, vd.ns[0:0], vd.actualNs[0:0], defaultCField, ctag)
+
+	err = vd.finishObserved()
+
 	v.pool.Put(vd)
 	return
 }
